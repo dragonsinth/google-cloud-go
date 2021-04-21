@@ -36,10 +36,15 @@ import (
 	"google.golang.org/grpc"
 )
 
-func TestConcurrentMutationsReadModifyAndGC(t *testing.T) {
-	s := &server{
-		tables: make(map[string]*table),
+func newServer() *server {
+	return &server{
+		tables:      make(map[string]*table),
+		rowsFactory: btreeFactory{},
 	}
+}
+
+func TestConcurrentMutationsReadModifyAndGC(t *testing.T) {
+	s := newServer()
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	if _, err := s.CreateTable(
@@ -141,9 +146,7 @@ func TestCreateTableResponse(t *testing.T) {
 	// We need to ensure that invoking CreateTable returns
 	// the  ColumnFamilies as well as Granularity.
 	// See issue https://github.com/googleapis/google-cloud-go/issues/1512.
-	s := &server{
-		tables: make(map[string]*table),
-	}
+	s := newServer()
 	ctx := context.Background()
 	got, err := s.CreateTable(ctx, &btapb.CreateTableRequest{
 		Parent:  "projects/issue-1512/instances/instance",
@@ -178,9 +181,7 @@ func TestCreateTableWithFamily(t *testing.T) {
 	// in one operation but it is allowed by the API. This must still be supported by the
 	// fake server so this test lives here instead of in the main bigtable
 	// integration test.
-	s := &server{
-		tables: make(map[string]*table),
-	}
+	s := newServer()
 	ctx := context.Background()
 	newTbl := btapb.Table{
 		ColumnFamilies: map[string]*btapb.ColumnFamily{
@@ -274,9 +275,7 @@ func TestSampleRowKeys(t *testing.T) {
 }
 
 func TestDropRowRange(t *testing.T) {
-	s := &server{
-		tables: make(map[string]*table),
-	}
+	s := newServer()
 	ctx := context.Background()
 	newTbl := btapb.Table{
 		ColumnFamilies: map[string]*btapb.ColumnFamily{
@@ -431,9 +430,7 @@ func TestCheckTimestampMaxValue(t *testing.T) {
 	// and that max Timestamp is the largest valid value in Millis.
 	// See issue https://github.com/googleapis/google-cloud-go/issues/1790
 	ctx := context.Background()
-	s := &server{
-		tables: make(map[string]*table),
-	}
+	s := newServer()
 	newTbl := btapb.Table{
 		ColumnFamilies: map[string]*btapb.ColumnFamily{
 			"cf0": {},
@@ -479,9 +476,7 @@ func TestCheckTimestampMaxValue(t *testing.T) {
 
 func TestReadRows(t *testing.T) {
 	ctx := context.Background()
-	s := &server{
-		tables: make(map[string]*table),
-	}
+	s := newServer()
 	newTbl := btapb.Table{
 		ColumnFamilies: map[string]*btapb.ColumnFamily{
 			"cf0": {GcRule: &btapb.GcRule{Rule: &btapb.GcRule_MaxNumVersions{MaxNumVersions: 1}}},
@@ -529,9 +524,7 @@ func TestReadRows(t *testing.T) {
 
 func TestReadRowsError(t *testing.T) {
 	ctx := context.Background()
-	s := &server{
-		tables: make(map[string]*table),
-	}
+	s := newServer()
 	newTbl := btapb.Table{
 		ColumnFamilies: map[string]*btapb.ColumnFamily{
 			"cf0": {GcRule: &btapb.GcRule{Rule: &btapb.GcRule_MaxNumVersions{MaxNumVersions: 1}}},
@@ -570,9 +563,7 @@ func TestReadRowsError(t *testing.T) {
 
 func TestReadRowsAfterDeletion(t *testing.T) {
 	ctx := context.Background()
-	s := &server{
-		tables: make(map[string]*table),
-	}
+	s := newServer()
 	newTbl := btapb.Table{
 		ColumnFamilies: map[string]*btapb.ColumnFamily{
 			"cf0": {},
@@ -609,9 +600,7 @@ func TestReadRowsAfterDeletion(t *testing.T) {
 }
 
 func TestReadRowsOrder(t *testing.T) {
-	s := &server{
-		tables: make(map[string]*table),
-	}
+	s := newServer()
 	ctx := context.Background()
 	newTbl := btapb.Table{
 		ColumnFamilies: map[string]*btapb.ColumnFamily{
@@ -763,9 +752,7 @@ func TestReadRowsOrder(t *testing.T) {
 
 func TestReadRowsWithlabelTransformer(t *testing.T) {
 	ctx := context.Background()
-	s := &server{
-		tables: make(map[string]*table),
-	}
+	s := newServer()
 	newTbl := btapb.Table{
 		ColumnFamilies: map[string]*btapb.ColumnFamily{
 			"cf0": {GcRule: &btapb.GcRule{Rule: &btapb.GcRule_MaxNumVersions{MaxNumVersions: 1}}},
@@ -834,9 +821,7 @@ func TestReadRowsWithlabelTransformer(t *testing.T) {
 }
 
 func TestCheckAndMutateRowWithoutPredicate(t *testing.T) {
-	s := &server{
-		tables: make(map[string]*table),
-	}
+	s := newServer()
 	ctx := context.Background()
 	newTbl := btapb.Table{
 		ColumnFamilies: map[string]*btapb.ColumnFamily{
@@ -889,7 +874,7 @@ func TestCheckAndMutateRowWithoutPredicate(t *testing.T) {
 
 func TestCheckAndMutateRowWithPredicate(t *testing.T) {
 	ctx := context.Background()
-	srv := &server{tables: make(map[string]*table)}
+	srv := newServer()
 
 	tblReq := &btapb.CreateTableRequest{
 		Parent:  "issue-1435",
@@ -1145,9 +1130,7 @@ func compareCellChunks(ci, cj *btpb.ReadRowsResponse_CellChunk) bool {
 }
 
 func TestServer_ReadModifyWriteRow(t *testing.T) {
-	s := &server{
-		tables: make(map[string]*table),
-	}
+	s := newServer()
 
 	ctx := context.Background()
 	newTbl := btapb.Table{
@@ -1300,9 +1283,7 @@ func TestFilters(t *testing.T) {
 
 	ctx := context.Background()
 
-	s := &server{
-		tables: make(map[string]*table),
-	}
+	s := newServer()
 
 	tblInfo, err := populateTable(ctx, s)
 	if err != nil {
@@ -1333,9 +1314,7 @@ func TestFilters(t *testing.T) {
 func Test_Mutation_DeleteFromColumn(t *testing.T) {
 	ctx := context.Background()
 
-	s := &server{
-		tables: make(map[string]*table),
-	}
+	s := newServer()
 
 	tblInfo, err := populateTable(ctx, s)
 	if err != nil {
@@ -1624,7 +1603,7 @@ func TestFilterRowWithUnicodeColumnQualifier(t *testing.T) {
 // See Issue https://github.com/googleapis/google-cloud-go/issues/1399
 func TestFilterRowWithSingleColumnQualifier(t *testing.T) {
 	ctx := context.Background()
-	srv := &server{tables: make(map[string]*table)}
+	srv := newServer()
 
 	tblReq := &btapb.CreateTableRequest{
 		Parent:  "issue-1399",
@@ -1732,7 +1711,7 @@ func TestValueFilterRowWithAlternationInRegex(t *testing.T) {
 	// Test that regex alternation is applied properly.
 	// See Issue https://github.com/googleapis/google-cloud-go/issues/1499
 	ctx := context.Background()
-	srv := &server{tables: make(map[string]*table)}
+	srv := newServer()
 
 	tblReq := &btapb.CreateTableRequest{
 		Parent:  "issue-1499",
