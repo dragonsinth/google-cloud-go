@@ -42,7 +42,7 @@ func (b btreeRows) Delete(key string) *row {
 	if item == nil {
 		return nil
 	}
-	return item.(*row)
+	return fromProto(item.(protoItem).buf)
 }
 
 func (b btreeRows) Get(key string) *row {
@@ -50,34 +50,43 @@ func (b btreeRows) Get(key string) *row {
 	if item == nil {
 		return nil
 	}
-	return item.(*row)
+	return fromProto(item.(protoItem).buf)
 }
 
 func (b btreeRows) ReplaceOrInsert(r *row) *row {
-	item := b.tree.ReplaceOrInsert(r)
+	item := b.tree.ReplaceOrInsert(protoItem{
+		key: r.key,
+		buf: toProto(r),
+	})
 	if item == nil {
 		return nil
 	}
-	return item.(*row)
+	return fromProto(item.(protoItem).buf)
 }
 
 func (b btreeRows) Clear() {
 	b.tree.Clear(false)
 }
 
-func (b btreeRows) key(key string) *row {
-	return &row{key: key}
+func (b btreeRows) key(key string) protoItem {
+	return protoItem{key: key}
 }
 
 func (b btreeRows) adaptIterator(iterator RowIterator) btree.ItemIterator {
 	return func(i btree.Item) bool {
-		return iterator(i.(*row))
+		r := fromProto(i.(protoItem).buf)
+		return iterator(r)
 	}
 }
 
-var _ btree.Item = (*row)(nil)
+type protoItem struct {
+	key string
+	buf []byte
+}
 
-// Less implements btree.Item.Less.
-func (r *row) Less(i btree.Item) bool {
-	return r.key < i.(*row).key
+var _ btree.Item = protoItem{}
+
+// Less implements btree.Item.
+func (bi protoItem) Less(i btree.Item) bool {
+	return bi.key < i.(protoItem).key
 }

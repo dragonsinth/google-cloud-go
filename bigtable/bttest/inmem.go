@@ -404,10 +404,7 @@ func (s *server) ReadRows(req *btpb.ReadRowsRequest, stream btpb.Bigtable_ReadRo
 
 	rows := make([]*row, 0, len(rowSet))
 	for _, r := range rowSet {
-		r.mu.Lock()
 		fams := len(r.families)
-		r.mu.Unlock()
-
 		if fams != 0 {
 			rows = append(rows, r)
 		}
@@ -434,11 +431,6 @@ func (s *server) ReadRows(req *btpb.ReadRowsRequest, stream btpb.Bigtable_ReadRo
 // streamRow filters the given row and sends it via the given stream.
 // Returns true if at least one cell matched the filter and was streamed, false otherwise.
 func streamRow(stream btpb.Bigtable_ReadRowsServer, fs map[string]*columnFamily, r *row, f *btpb.RowFilter) (bool, error) {
-	r.mu.Lock()
-	nr := r.copy()
-	r.mu.Unlock()
-	r = nr
-
 	match, err := filterRow(f, r)
 	if err != nil {
 		return false, err
@@ -793,22 +785,16 @@ func (s *server) MutateRow(ctx context.Context, req *btpb.MutateRowRequest) (*bt
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "table %q not found", req.TableName)
 	}
-	fs := tbl.columnFamilies()
-	r := tbl.mutableRow(string(req.RowKey))
 
-	success := false
-	defer func() {
-		if success {
-			tbl.commitRow(r)
-		}
-	}()
+	tbl.mu.Lock()
+	defer tbl.mu.Unlock()
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if err := applyMutations(tbl, r, req.Mutations, fs); err != nil {
+	r := tbl.getOrCreateRow(string(req.RowKey))
+
+	if err := applyMutations(tbl, r, req.Mutations, tbl.families); err != nil {
 		return nil, err
 	}
-	success = true
+	tbl.rows.ReplaceOrInsert(r)
 	return &btpb.MutateRowResponse{}, nil
 }
 
@@ -821,25 +807,19 @@ func (s *server) MutateRows(req *btpb.MutateRowsRequest, stream btpb.Bigtable_Mu
 	}
 	res := &btpb.MutateRowsResponse{Entries: make([]*btpb.MutateRowsResponse_Entry, len(req.Entries))}
 
-	fs := tbl.columnFamilies()
+	tbl.mu.Lock()
+	defer tbl.mu.Unlock()
 
 	for i, entry := range req.Entries {
 		func() {
-			r := tbl.mutableRow(string(entry.RowKey))
-			success := false
-			defer func() {
-				if success {
-					tbl.commitRow(r)
-				}
-			}()
-			r.mu.Lock()
-			defer r.mu.Unlock()
+			r := tbl.getOrCreateRow(string(entry.RowKey))
+
 			code, msg := int32(codes.OK), ""
-			if err := applyMutations(tbl, r, entry.Mutations, fs); err != nil {
+			if err := applyMutations(tbl, r, entry.Mutations, tbl.families); err != nil {
 				code = int32(codes.Internal)
 				msg = err.Error()
 			}
-			success = true
+			tbl.rows.ReplaceOrInsert(r)
 			res.Entries[i] = &btpb.MutateRowsResponse_Entry{
 				Index:  int64(i),
 				Status: &statpb.Status{Code: code, Message: msg},
@@ -858,18 +838,10 @@ func (s *server) CheckAndMutateRow(ctx context.Context, req *btpb.CheckAndMutate
 	}
 	res := &btpb.CheckAndMutateRowResponse{}
 
-	fs := tbl.columnFamilies()
+	tbl.mu.Lock()
+	defer tbl.mu.Unlock()
 
-	r := tbl.mutableRow(string(req.RowKey))
-	success := false
-	defer func() {
-		if success {
-			tbl.commitRow(r)
-		}
-	}()
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r := tbl.getOrCreateRow(string(req.RowKey))
 
 	// Figure out which mutation to apply.
 	whichMut := false
@@ -893,10 +865,10 @@ func (s *server) CheckAndMutateRow(ctx context.Context, req *btpb.CheckAndMutate
 		muts = req.TrueMutations
 	}
 
-	if err := applyMutations(tbl, r, muts, fs); err != nil {
+	if err := applyMutations(tbl, r, muts, tbl.families); err != nil {
 		return nil, err
 	}
-	success = true
+	tbl.rows.ReplaceOrInsert(r)
 	return res, nil
 }
 
@@ -1025,26 +997,18 @@ func (s *server) ReadModifyWriteRow(ctx context.Context, req *btpb.ReadModifyWri
 		return nil, status.Errorf(codes.NotFound, "table %q not found", req.TableName)
 	}
 
-	fs := tbl.columnFamilies()
-
 	rowKey := string(req.RowKey)
-	r := tbl.mutableRow(rowKey)
+
+	tbl.mu.Lock()
+	defer tbl.mu.Unlock()
+
+	r := tbl.getOrCreateRow(rowKey)
 	resultRow := newRow(rowKey) // copy of updated cells
 
-	success := false
-	defer func() {
-		if success {
-			tbl.commitRow(r)
-		}
-	}()
-
-	// This must be done before the row lock, acquired below, is released.
-	r.mu.Lock()
-	defer r.mu.Unlock()
 	// Assume all mutations apply to the most recent version of the cell.
 	// TODO(dsymonds): Verify this assumption and document it in the proto.
 	for _, rule := range req.Rules {
-		if _, ok := fs[rule.FamilyName]; !ok {
+		if _, ok := tbl.families[rule.FamilyName]; !ok {
 			return nil, fmt.Errorf("unknown family %q", rule.FamilyName)
 		}
 
@@ -1095,13 +1059,15 @@ func (s *server) ReadModifyWriteRow(ctx context.Context, req *btpb.ReadModifyWri
 		resultFamily.cells[col] = []cell{newCell} // overwrite the cells
 	}
 
-	// Build the response using the result row
+	tbl.rows.ReplaceOrInsert(r)
+
+	// Build the response
 	res := &btpb.Row{
 		Key:      req.RowKey,
 		Families: make([]*btpb.Family, len(resultRow.families)),
 	}
 
-	for i, family := range resultRow.sortedFamilies(fs) {
+	for i, family := range resultRow.sortedFamilies(tbl.families) {
 		res.Families[i] = &btpb.Family{
 			Name:    family.name,
 			Columns: make([]*btpb.Column, len(family.colNames)),
@@ -1118,7 +1084,6 @@ func (s *server) ReadModifyWriteRow(ctx context.Context, req *btpb.ReadModifyWri
 		}
 	}
 
-	success = true
 	return &btpb.ReadModifyWriteRowResponse{Row: res}, nil
 }
 
@@ -1152,9 +1117,7 @@ func (s *server) SampleRowKeys(req *btpb.SampleRowKeysRequest, stream btpb.Bigta
 		} else {
 			lastRow = r
 		}
-		r.mu.Lock()
 		offset += int64(r.size())
-		r.mu.Unlock()
 		return true
 	})
 	if err == nil && lastRow != nil {
@@ -1251,37 +1214,17 @@ func (t *table) columnFamilies() map[string]*columnFamily {
 	return cp
 }
 
-func (t *table) mutableRow(key string) *row {
-	// Try fast path first.
-	t.mu.RLock()
+// Must hold table lock.
+func (t *table) getOrCreateRow(key string) *row {
 	r := t.rows.Get(key)
-	t.mu.RUnlock()
 	if r != nil {
 		return r
 	}
-
-	// We probably need to create the row.
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	r = t.rows.Get(key)
-	if r != nil {
-		return r
-	}
-	r = newRow(key)
-	t.rows.ReplaceOrInsert(r)
-	return r
-}
-
-func (t *table) commitRow(r *row) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	t.rows.ReplaceOrInsert(r)
+	return newRow(key)
 }
 
 func (t *table) gc() {
-	// TODO(scottb): deal with GC better later.
+	// TODO(scottb): deal with GC better later; only dirty tables; less frequent.
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -1296,11 +1239,15 @@ func (t *table) gc() {
 		return
 	}
 
+	i := 0
 	t.rows.Ascend(func(r *row) bool {
-		r.mu.Lock()
+		i++
+		if i%100 == 0 {
+			t.mu.Unlock()
+			t.mu.Lock()
+		}
 		r.gc(rules)
 		t.rows.ReplaceOrInsert(r)
-		r.mu.Unlock()
 		return true
 	})
 }
@@ -1312,9 +1259,7 @@ func (b byRowKey) Swap(i, j int)      { b[i], b[j] = b[j], b[i] }
 func (b byRowKey) Less(i, j int) bool { return b[i].key < b[j].key }
 
 type row struct {
-	key string
-
-	mu       sync.Mutex
+	key      string
 	families map[string]*family // keyed by family name
 }
 
