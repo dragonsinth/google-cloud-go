@@ -1,7 +1,11 @@
 package bttest
 
 import (
+	"bytes"
+
+	"github.com/golang/protobuf/proto"
 	"github.com/google/btree"
+	btpb "google.golang.org/genproto/googleapis/bigtable/v2"
 )
 
 const btreeDegree = 16
@@ -25,19 +29,19 @@ func (b btreeRows) Ascend(iterator RowIterator) {
 	b.tree.Ascend(b.adaptIterator(iterator))
 }
 
-func (b btreeRows) AscendRange(greaterOrEqual, lessThan string, iterator RowIterator) {
+func (b btreeRows) AscendRange(greaterOrEqual, lessThan keyType, iterator RowIterator) {
 	b.tree.AscendRange(b.key(greaterOrEqual), b.key(lessThan), b.adaptIterator(iterator))
 }
 
-func (b btreeRows) AscendLessThan(pivot string, iterator RowIterator) {
+func (b btreeRows) AscendLessThan(pivot keyType, iterator RowIterator) {
 	b.tree.AscendLessThan(b.key(pivot), b.adaptIterator(iterator))
 }
 
-func (b btreeRows) AscendGreaterOrEqual(pivot string, iterator RowIterator) {
+func (b btreeRows) AscendGreaterOrEqual(pivot keyType, iterator RowIterator) {
 	b.tree.AscendGreaterOrEqual(b.key(pivot), b.adaptIterator(iterator))
 }
 
-func (b btreeRows) Delete(key string) *row {
+func (b btreeRows) Delete(key keyType) *btpb.Row {
 	item := b.tree.Delete(b.key(key))
 	if item == nil {
 		return nil
@@ -45,7 +49,7 @@ func (b btreeRows) Delete(key string) *row {
 	return fromProto(item.(protoItem).buf)
 }
 
-func (b btreeRows) Get(key string) *row {
+func (b btreeRows) Get(key keyType) *btpb.Row {
 	item := b.tree.Get(b.key(key))
 	if item == nil {
 		return nil
@@ -53,9 +57,9 @@ func (b btreeRows) Get(key string) *row {
 	return fromProto(item.(protoItem).buf)
 }
 
-func (b btreeRows) ReplaceOrInsert(r *row) *row {
+func (b btreeRows) ReplaceOrInsert(r *btpb.Row) *btpb.Row {
 	item := b.tree.ReplaceOrInsert(protoItem{
-		key: r.key,
+		key: r.Key,
 		buf: toProto(r),
 	})
 	if item == nil {
@@ -68,7 +72,7 @@ func (b btreeRows) Clear() {
 	b.tree.Clear(false)
 }
 
-func (b btreeRows) key(key string) protoItem {
+func (b btreeRows) key(key keyType) protoItem {
 	return protoItem{key: key}
 }
 
@@ -79,8 +83,24 @@ func (b btreeRows) adaptIterator(iterator RowIterator) btree.ItemIterator {
 	}
 }
 
+func fromProto(buf []byte) *btpb.Row {
+	var p btpb.Row
+	if err := proto.Unmarshal(buf, &p); err != nil {
+		panic(err)
+	}
+	return &p
+}
+
+func toProto(r *btpb.Row) []byte {
+	if buf, err := proto.Marshal(r); err != nil {
+		panic(err)
+	} else {
+		return buf
+	}
+}
+
 type protoItem struct {
-	key string
+	key keyType
 	buf []byte
 }
 
@@ -88,5 +108,5 @@ var _ btree.Item = protoItem{}
 
 // Less implements btree.Item.
 func (bi protoItem) Less(i btree.Item) bool {
-	return bi.key < i.(protoItem).key
+	return bytes.Compare(bi.key, i.(protoItem).key) < 0
 }
