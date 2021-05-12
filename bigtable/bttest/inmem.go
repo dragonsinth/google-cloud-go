@@ -1096,10 +1096,10 @@ func (s *server) SampleRowKeys(req *btpb.SampleRowKeysRequest, stream btpb.Bigta
 	// final row key in the table and choose other row keys randomly.
 	var offset int64
 	var err error
-	i := 0
+	var lastRow *row
 	tbl.rows.Ascend(func(it btree.Item) bool {
 		row := it.(*row)
-		if i == tbl.rows.Len()-1 || rand.Int31n(100) == 0 {
+		if rand.Int31n(100) == 0 {
 			resp := &btpb.SampleRowKeysResponse{
 				RowKey:      []byte(row.key),
 				OffsetBytes: offset,
@@ -1108,11 +1108,20 @@ func (s *server) SampleRowKeys(req *btpb.SampleRowKeysRequest, stream btpb.Bigta
 			if err != nil {
 				return false
 			}
+			lastRow = nil
+		} else {
+			lastRow = row
 		}
 		offset += int64(row.size())
-		i++
 		return true
 	})
+	if err == nil && lastRow != nil {
+		resp := &btpb.SampleRowKeysResponse{
+			RowKey:      []byte(lastRow.key),
+			OffsetBytes: offset - int64(lastRow.size()),
+		}
+		err = stream.Send(resp)
+	}
 	return err
 }
 
