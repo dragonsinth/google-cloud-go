@@ -189,7 +189,7 @@ func (s *Server) PublishOrdered(topic string, data []byte, attrs map[string]stri
 	if !ok {
 		panic(fmt.Sprintf("topic name must be of the form %q", topicPattern))
 	}
-	s.GServer.CreateTopic(context.TODO(), &pb.Topic{Name: topic})
+	_, _ = s.GServer.CreateTopic(context.TODO(), &pb.Topic{Name: topic})
 	req := &pb.PublishRequest{
 		Topic:    topic,
 		Messages: []*pb.PubsubMessage{{Data: data, Attributes: attrs, OrderingKey: orderingKey}},
@@ -968,7 +968,7 @@ func (s *GServer) StreamingPull(sps pb.Subscriber_StreamingPullServer) error {
 	return err
 }
 
-func (s *GServer) Seek(_ context.Context, req *pb.SeekRequest) (*pb.SeekResponse, error) {
+func (s *GServer) Seek(_ context.Context, _ *pb.SeekRequest) (*pb.SeekResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "Seek not implemented")
 }
 
@@ -1633,15 +1633,13 @@ func (s *GServer) ValidateMessage(_ context.Context, req *pb.ValidateMessageRequ
 func minDuration(a, b time.Duration) time.Duration {
 	if a < b {
 		return a
-	} else {
-		return b
 	}
+	return b
 }
 
 func maxDuration(a, b time.Duration) time.Duration {
 	if a > b {
 		return a
-	} else {
-		return b
 	}
+	return b
 }
