@@ -46,6 +46,13 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
+const (
+	minAllowedBackoff = 1 * time.Second // GCP allows us to set it to 0, but we allow 1 for simplification.
+	defaultMinBackoff = 10 * time.Second
+	maxAllowedBackoff = 600 * time.Second
+	defaultMaxBackoff = maxAllowedBackoff
+)
+
 // ReactorOptions is a map that Server uses to look up reactors.
 // Key is the function name, value is array of reactor for the function.
 type ReactorOptions map[string][]Reactor
@@ -88,8 +95,6 @@ type GServer struct {
 	mu             sync.Mutex
 	topics         map[string]*topic
 	subs           map[string]*subscription
-	msgs           []*Message // all messages ever published
-	msgsByID       map[string]*Message
 	wg             sync.WaitGroup
 	nextID         int
 	streamTimeout  time.Duration
@@ -134,7 +139,6 @@ func NewServerWithCallback(port int, callback func(*grpc.Server), opts ...Server
 		GServer: GServer{
 			topics:              map[string]*topic{},
 			subs:                map[string]*subscription{},
-			msgsByID:            map[string]*Message{},
 			reactorOptions:      reactorOptions,
 			publishResponses:    make(chan *publishResponse, 100),
 			autoPublishResponse: true,
@@ -236,75 +240,9 @@ func (s *Server) SetStreamTimeout(d time.Duration) {
 	s.GServer.streamTimeout = d
 }
 
-// A Message is a message that was published to the server.
-type Message struct {
-	ID          string
-	Data        []byte
-	Attributes  map[string]string
-	PublishTime time.Time
-	Deliveries  int      // number of times delivery of the message was attempted
-	Acks        int      // number of acks received from clients
-	Modacks     []Modack // modacks received by server for this message
-	OrderingKey string
-
-	// protected by server mutex
-	deliveries int
-	acks       int
-	modacks    []Modack
-}
-
-// Modack represents a modack sent to the server.
-type Modack struct {
-	AckID       string
-	AckDeadline int32
-	ReceivedAt  time.Time
-}
-
-// Messages returns information about all messages ever published.
-func (s *Server) Messages() []*Message {
-	s.GServer.mu.Lock()
-	defer s.GServer.mu.Unlock()
-
-	var msgs []*Message
-	for _, m := range s.GServer.msgs {
-		m.Deliveries = m.deliveries
-		m.Acks = m.acks
-		m.Modacks = append([]Modack(nil), m.modacks...)
-		msgs = append(msgs, m)
-	}
-	return msgs
-}
-
-// Message returns the message with the given ID, or nil if no message
-// with that ID was published.
-func (s *Server) Message(id string) *Message {
-	s.GServer.mu.Lock()
-	defer s.GServer.mu.Unlock()
-
-	m := s.GServer.msgsByID[id]
-	if m != nil {
-		m.Deliveries = m.deliveries
-		m.Acks = m.acks
-		m.Modacks = append([]Modack(nil), m.modacks...)
-	}
-	return m
-}
-
 // Wait blocks until all server activity has completed.
 func (s *Server) Wait() {
 	s.GServer.wg.Wait()
-}
-
-// ClearMessages removes all published messages
-// from internal containers.
-func (s *Server) ClearMessages() {
-	s.GServer.mu.Lock()
-	s.GServer.msgs = nil
-	s.GServer.msgsByID = make(map[string]*Message)
-	for _, sub := range s.GServer.subs {
-		sub.msgs = map[string]*message{}
-	}
-	s.GServer.mu.Unlock()
 }
 
 // Close shuts down the server and releases all resources.
@@ -822,17 +760,13 @@ func (s *GServer) Publish(_ context.Context, req *pb.PublishRequest) (*pb.Publis
 		pubTime := s.now()
 		tsPubTime := timestamppb.New(pubTime)
 		pm.PublishTime = tsPubTime
-		m := &Message{
-			ID:          id,
-			Data:        pm.Data,
-			Attributes:  pm.Attributes,
-			PublishTime: pubTime,
-			OrderingKey: pm.OrderingKey,
-		}
-		top.publish(pm, m)
+		top.publish(pm, message{
+			publishTime: pubTime,
+			deliveries:  0,
+			acks:        0,
+			streamIndex: -1,
+		})
 		ids = append(ids, id)
-		s.msgs = append(s.msgs, m)
-		s.msgsByID[id] = m
 	}
 	return &pb.PublishResponse{MessageIds: ids}, nil
 }
@@ -859,18 +793,14 @@ func (t *topic) deleteSub(sub *subscription) {
 	delete(t.subs, sub.proto.Name)
 }
 
-func (t *topic) publish(pm *pb.PubsubMessage, m *Message) {
+func (t *topic) publish(pm *pb.PubsubMessage, m message) {
 	for _, s := range t.subs {
-		s.msgs[pm.MessageId] = &message{
-			publishTime: m.PublishTime,
-			proto: &pb.ReceivedMessage{
-				AckId:   pm.MessageId,
-				Message: pm,
-			},
-			deliveries:  &m.deliveries,
-			acks:        &m.acks,
-			streamIndex: -1,
+		m := m
+		m.proto = &pb.ReceivedMessage{
+			AckId:   pm.MessageId,
+			Message: pm,
 		}
+		s.msgs[pm.MessageId] = &m
 	}
 }
 
@@ -962,10 +892,6 @@ func (s *GServer) ModifyAckDeadline(_ context.Context, req *pb.ModifyAckDeadline
 	if err != nil {
 		return nil, err
 	}
-	now := time.Now()
-	for _, id := range req.AckIds {
-		s.msgsByID[id].modacks = append(s.msgsByID[id].modacks, Modack{AckID: id, AckDeadline: req.AckDeadlineSeconds, ReceivedAt: now})
-	}
 	dur := secsToDur(req.AckDeadlineSeconds)
 	for _, id := range req.AckIds {
 		sub.modifyAckDeadline(id, dur)
@@ -1002,15 +928,21 @@ func (s *GServer) Pull(ctx context.Context, req *pb.PullRequest) (*pb.PullRespon
 	// Otherwise, the system may wait (for a bounded amount of time) until at
 	// least one message is available, rather than returning no messages."
 	if len(msgs) == 0 && !req.ReturnImmediately {
-		// Wait for a short amount of time for a message.
-		// TODO: signal when a message arrives, so we don't wait the whole time.
+		// Wait up to 20 seconds for a message to arrive, using a stream.
+		// We don't need a full `stream{}`, just need to be in queue for `tryDeliverMessage()`
+		st := sub.newStream(nil, 0)
+		defer sub.deleteStream(st)
+		defer close(st.done)
+
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-time.After(500 * time.Millisecond):
-			s.mu.Lock()
-			msgs = sub.pull(max)
-			s.mu.Unlock()
+		case m := <-st.msgc:
+			msgs = append(msgs, m)
+			break
+		case <-time.After(20 * time.Second):
+			// give up, return 0 messages
+			break
 		}
 	}
 	return &pb.PullResponse{ReceivedMessages: msgs}, nil
@@ -1036,58 +968,8 @@ func (s *GServer) StreamingPull(sps pb.Subscriber_StreamingPullServer) error {
 	return err
 }
 
-func (s *GServer) Seek(ctx context.Context, req *pb.SeekRequest) (*pb.SeekResponse, error) {
-	// Only handle time-based seeking for now.
-	// This fake doesn't deal with snapshots.
-	var target time.Time
-	switch v := req.Target.(type) {
-	case nil:
-		return nil, status.Errorf(codes.InvalidArgument, "missing Seek target type")
-	case *pb.SeekRequest_Time:
-		target = v.Time.AsTime()
-	default:
-		return nil, status.Errorf(codes.Unimplemented, "unhandled Seek target type %T", v)
-	}
-
-	// The entire server must be locked while doing the work below,
-	// because the messages don't have any other synchronization.
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if handled, ret, err := s.runReactor(req, "Seek", &pb.SeekResponse{}); handled || err != nil {
-		return ret.(*pb.SeekResponse), err
-	}
-
-	sub, err := s.findSubscription(req.Subscription)
-	if err != nil {
-		return nil, err
-	}
-	// Drop all messages from sub that were published before the target time.
-	for id, m := range sub.msgs {
-		if m.publishTime.Before(target) {
-			delete(sub.msgs, id)
-			(*m.acks)++
-		}
-	}
-	// Un-ack any already-acked messages after this time;
-	// redelivering them to the subscription is the closest analogue here.
-	for _, m := range s.msgs {
-		if m.PublishTime.Before(target) {
-			continue
-		}
-		sub.msgs[m.ID] = &message{
-			publishTime: m.PublishTime,
-			proto: &pb.ReceivedMessage{
-				AckId: m.ID,
-				// This was not preserved!
-				//Message: pm,
-			},
-			deliveries:  &m.deliveries,
-			acks:        &m.acks,
-			streamIndex: -1,
-		}
-	}
-	return &pb.SeekResponse{}, nil
+func (s *GServer) Seek(_ context.Context, req *pb.SeekRequest) (*pb.SeekResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "Seek not implemented")
 }
 
 // Gets a subscription that must exist.
@@ -1110,7 +992,7 @@ func (s *subscription) pull(max int) []*pb.ReceivedMessage {
 	var msgs []*pb.ReceivedMessage
 	filterMsgs(s.msgs, s.filter)
 	for id, m := range orderMsgs(s.msgs, s.proto.EnableMessageOrdering) {
-		if m.outstanding() {
+		if !m.available(now) {
 			continue
 		}
 		if s.deadLetterCandidate(m) {
@@ -1118,9 +1000,9 @@ func (s *subscription) pull(max int) []*pb.ReceivedMessage {
 			s.publishToDeadLetter(m)
 			continue
 		}
-		(*m.deliveries)++
+		m.deliveries++
 		if s.proto.DeadLetterPolicy != nil {
-			m.proto.DeliveryAttempt = int32(*m.deliveries)
+			m.proto.DeliveryAttempt = int32(m.deliveries)
 		}
 		m.ackDeadline = now.Add(s.ackTimeout)
 		msgs = append(msgs, m.proto)
@@ -1177,7 +1059,7 @@ func (s *subscription) deliver() {
 	curIndex := 0
 	filterMsgs(s.msgs, s.filter)
 	for id, m := range orderMsgs(s.msgs, s.proto.EnableMessageOrdering) {
-		if m.outstanding() {
+		if !m.available(now) {
 			continue
 		}
 		if s.deadLetterCandidate(m) {
@@ -1231,7 +1113,7 @@ func (s *subscription) tryDeliverMessage(m *message, start int, now time.Time) (
 			i--
 
 		case st.msgc <- m.proto:
-			(*m.deliveries)++
+			m.deliveries++
 			m.ackDeadline = now.Add(st.ackTimeout)
 			return idx, true
 
@@ -1251,8 +1133,8 @@ const retentionDuration = 10 * time.Minute
 func (s *subscription) maintainMessages(now time.Time) {
 	for id, m := range s.msgs {
 		// Mark a message as re-deliverable if its ack deadline has expired.
-		if m.outstanding() && now.After(m.ackDeadline) {
-			m.makeAvailable()
+		if m.outstanding() && !now.Before(m.ackDeadline) {
+			m.nack(m.ackDeadline, s.proto.RetryPolicy)
 		}
 		pubTime := m.proto.Message.PublishTime.AsTime()
 		// Remove messages that have been undelivered for a long time.
@@ -1304,19 +1186,7 @@ func (s *subscription) deadLetterCandidate(m *message) bool {
 }
 
 func (s *subscription) publishToDeadLetter(m *message) {
-	acks := 0
-	if m.acks != nil {
-		acks = *m.acks
-	}
-	deliveries := 0
-	if m.deliveries != nil {
-		deliveries = *m.deliveries
-	}
-	s.deadLetterTopic.publish(m.proto.Message, &Message{
-		PublishTime: m.publishTime,
-		Acks:        acks,
-		Deliveries:  deliveries,
-	})
+	s.deadLetterTopic.publish(m.proto.Message, *m)
 }
 
 func deleteStreamAt(s []*stream, i int) []*stream {
@@ -1328,9 +1198,11 @@ type message struct {
 	proto       *pb.ReceivedMessage
 	publishTime time.Time
 	ackDeadline time.Time
-	deliveries  *int
-	acks        *int
+	deliveries  int
+	acks        int
 	streamIndex int // index of stream that currently owns msg, for round-robin delivery
+	// retryDeadline, when set, is the time after which the message should be redelivered.
+	retryDeadline time.Time
 }
 
 // A message is outstanding if it is owned by some stream.
@@ -1338,13 +1210,38 @@ func (m *message) outstanding() bool {
 	return !m.ackDeadline.IsZero()
 }
 
-// A message is outstanding if it is owned by some stream.
-func (m *message) retriesDone(maxRetries int32) bool {
-	return m.deliveries != nil && int32(*m.deliveries) >= maxRetries
+// A message is coolingDown when it is not yet ready to be redelivered (a retry backoff policy was configured).
+func (m *message) coolingDown(now time.Time) bool {
+	return !m.retryDeadline.IsZero() && now.Before(m.retryDeadline)
 }
 
-func (m *message) makeAvailable() {
+// A message is available if it is a) not leased and b) not on retry policy cooldown.
+func (m *message) available(now time.Time) bool {
+	return !m.outstanding() && !m.coolingDown(now)
+}
+
+// A message is outstanding if it is owned by some stream.
+func (m *message) retriesDone(maxRetries int32) bool {
+	return int32(m.deliveries) >= maxRetries
+}
+
+func (m *message) nack(now time.Time, retryPolicy *pb.RetryPolicy) {
 	m.ackDeadline = time.Time{}
+	if retryPolicy != nil {
+		minBackoff := defaultMinBackoff
+		if retryPolicy.MinimumBackoff != nil {
+			minBackoff = maxDuration(minAllowedBackoff, retryPolicy.MinimumBackoff.AsDuration())
+		}
+
+		maxBackoff := defaultMaxBackoff
+		if retryPolicy.MaximumBackoff != nil {
+			maxBackoff = minDuration(maxAllowedBackoff, retryPolicy.MaximumBackoff.AsDuration())
+		}
+
+		backoffMultiplier := time.Duration(1 << (m.deliveries - 1))
+		backoffDuration := minDuration(minBackoff*backoffMultiplier, maxBackoff)
+		m.retryDeadline = now.Add(backoffDuration)
+	}
 }
 
 type stream struct {
@@ -1437,7 +1334,7 @@ func (s *subscription) handleStreamingPullRequest(st *stream, req *pb.StreamingP
 func (s *subscription) ack(id string) {
 	m := s.msgs[id]
 	if m != nil {
-		(*m.acks)++
+		m.acks++
 		delete(s.msgs, id)
 	}
 }
@@ -1448,10 +1345,11 @@ func (s *subscription) modifyAckDeadline(id string, d time.Duration) {
 	if m == nil { // already acked: ignore.
 		return
 	}
+	now := s.timeNowFunc()
 	if d == 0 { // nack
-		m.makeAvailable()
+		m.nack(now, s.proto.RetryPolicy)
 	} else { // extend the deadline by d
-		m.ackDeadline = s.timeNowFunc().Add(d)
+		m.ackDeadline = now.Add(d)
 	}
 }
 
@@ -1730,4 +1628,20 @@ func (s *GServer) ValidateMessage(_ context.Context, req *pb.ValidateMessageRequ
 	}
 
 	return &pb.ValidateMessageResponse{}, nil
+}
+
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	} else {
+		return b
+	}
+}
+
+func maxDuration(a, b time.Duration) time.Duration {
+	if a > b {
+		return a
+	} else {
+		return b
+	}
 }
