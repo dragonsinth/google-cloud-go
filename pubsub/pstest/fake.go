@@ -1438,9 +1438,9 @@ func (s *GServer) GetSchema(_ context.Context, req *pb.GetSchemaRequest) (*pb.Sc
 
 	ss := strings.Split(req.Name, "@")
 	var schemaName, revisionID string
-	if len := len(ss); len == 1 {
+	if l := len(ss); l == 1 {
 		schemaName = ss[0]
-	} else if len == 2 {
+	} else if l == 2 {
 		schemaName = ss[0]
 		revisionID = ss[1]
 	} else {
