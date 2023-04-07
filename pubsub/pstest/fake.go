@@ -1338,9 +1338,9 @@ func (s *GServer) GetSchema(_ context.Context, req *pb.GetSchemaRequest) (*pb.Sc
 
 	ss := strings.Split(req.Name, "@")
 	var schemaName, revisionID string
-	if len := len(ss); len == 1 {
+	if l := len(ss); l == 1 {
 		schemaName = ss[0]
-	} else if len == 2 {
+	} else if l == 2 {
 		schemaName = ss[0]
 		revisionID = ss[1]
 	} else {
@@ -1427,9 +1427,13 @@ func (s *GServer) RollbackSchema(_ context.Context, req *pb.RollbackSchemaReques
 
 	for _, sc := range s.schemas[req.Name] {
 		if sc.RevisionId == req.RevisionId {
-			newSchema := *sc
-			newSchema.RevisionId = genRevID()
-			newSchema.RevisionCreateTime = timestamppb.Now()
+			newSchema := pb.Schema{
+				Name:               sc.GetName(),
+				Definition:         sc.GetDefinition(),
+				Type:               sc.GetType(),
+				RevisionId:         genRevID(),
+				RevisionCreateTime: timestamppb.Now(),
+			}
 			s.schemas[req.Name] = append(s.schemas[req.Name], &newSchema)
 			return &newSchema, nil
 		}
