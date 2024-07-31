@@ -1100,7 +1100,7 @@ func (s *subscription) tryDeliverMessage(m *message, start int, now time.Time) (
 	// safe since the lock is held for the duration of this function, and the channel receiver does not
 	// modify the message.
 	if s.proto.DeadLetterPolicy != nil {
-		m.proto.DeliveryAttempt = int32(*m.deliveries) + 1
+		m.proto.DeliveryAttempt = int32(m.deliveries) + 1
 	}
 
 	for i := 0; i < len(s.streams); i++ {
@@ -1122,7 +1122,7 @@ func (s *subscription) tryDeliverMessage(m *message, start int, now time.Time) (
 	}
 	// Restore the correct value of DeliveryAttempt if we were not able to deliver the message.
 	if s.proto.DeadLetterPolicy != nil {
-		m.proto.DeliveryAttempt = int32(*m.deliveries)
+		m.proto.DeliveryAttempt = int32(m.deliveries)
 	}
 	return 0, false
 }
